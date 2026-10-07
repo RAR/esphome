@@ -1,3 +1,5 @@
+import logging
+
 from esphome import automation
 from esphome.automation import Condition
 import esphome.codegen as cg
@@ -78,7 +80,10 @@ def AUTO_LOAD():
 
 
 CONF_IDF_SEND_ASYNC = "idf_send_async"
+CONF_SUB_DEVICE_TOPICS = "sub_device_topics"
 CONF_WAIT_FOR_CONNECTION = "wait_for_connection"
+
+_LOGGER = logging.getLogger(__name__)
 
 # Max lengths for stack-based topic building.
 # These values are used in cv.Length() validators below to ensure the C++ code
@@ -269,6 +274,7 @@ CONFIG_SCHEMA = cv.All(
                 MQTT_DISCOVERY_OBJECT_ID_GENERATOR_OPTIONS
             ),
             cv.Optional(CONF_USE_ABBREVIATIONS, default=True): cv.boolean,
+            cv.Optional(CONF_SUB_DEVICE_TOPICS, default=False): cv.boolean,
             cv.Optional(CONF_BIRTH_MESSAGE): MQTT_MESSAGE_SCHEMA,
             cv.Optional(CONF_WILL_MESSAGE): MQTT_MESSAGE_SCHEMA,
             cv.Optional(CONF_SHUTDOWN_MESSAGE): MQTT_MESSAGE_SCHEMA,
@@ -347,6 +353,44 @@ def exp_mqtt_message(config):
     )
 
 
+def _shared_sub_device_topics() -> list[list[str]]:
+    """Groups of entity names on different sub-devices that get one MQTT topic.
+
+    The duplicate check lets equally named entities sit on different sub-devices,
+    which the native API keeps apart, but default MQTT topics and discovery ids are
+    built from the name alone.
+    """
+    groups: dict[tuple[str, int], list[tuple[str, str]]] = {}
+    for (device_id, platform, name_hash), meta in CORE.unique_ids.items():
+        groups.setdefault((platform, name_hash), []).append((device_id, meta["name"]))
+    shared = []
+    for (platform, _), entries in sorted(groups.items()):
+        if len({device_id for device_id, _ in entries}) > 1:
+            shared.append(
+                [
+                    f"{platform} '{name}' on {f'device {device_id!r}' if device_id else 'the main device'}"
+                    for device_id, name in sorted(entries)
+                ]
+            )
+    return shared
+
+
+def _final_validate(config: ConfigType) -> ConfigType:
+    if config[CONF_SUB_DEVICE_TOPICS] or not config[CONF_TOPIC_PREFIX]:
+        return config
+    for group in _shared_sub_device_topics():
+        _LOGGER.warning(
+            "MQTT: %s share one topic and discovery id, so their states overwrite each "
+            "other. Set 'sub_device_topics: true' under 'mqtt:' to give entities on a "
+            "sub-device their own topics, or give these a custom 'state_topic'.",
+            ", ".join(group),
+        )
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
+
+
 @coroutine_with_priority(CoroPriority.WEB)
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
@@ -417,6 +461,9 @@ async def to_code(config):
 
     if config[CONF_USE_ABBREVIATIONS]:
         cg.add_define("USE_MQTT_ABBREVIATIONS")
+
+    if config[CONF_SUB_DEVICE_TOPICS]:
+        cg.add_define("USE_MQTT_SUB_DEVICE_TOPICS")
 
     birth_message = config[CONF_BIRTH_MESSAGE]
     if not birth_message:
